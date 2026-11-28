@@ -24,13 +24,15 @@ import (
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/storage/driver"
 
 	common "github.com/helm/helm-mapkubeapis/pkg/common"
 	"github.com/helm/helm-mapkubeapis/pkg/mapping"
 )
 
-// MapReleaseWithUnSupportedAPIs checks the latest release version for any deprecated or removed APIs in its metadata
-// If it finds any, it will create a new release version with the APIs mapped to the supported versions
+// MapReleaseWithUnSupportedAPIs checks the release version that Helm would upgrade from for any deprecated or removed
+// APIs in its metadata. That is the last deployed version, or the latest version when nothing is deployed. If it finds
+// any, it will create a new release version with the APIs mapped to the supported versions
 func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions, additionalMappings ...*mapping.Mapping) error {
 	cfg, err := GetActionConfig(mapOptions.ReleaseNamespace, mapOptions.KubeConfig)
 	if err != nil {
@@ -39,7 +41,7 @@ func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions, additionalMappi
 
 	var releaseName = mapOptions.ReleaseName
 	log.Printf("Get release '%s' latest version.\n", releaseName)
-	releaseToMap, err := getLatestRelease(releaseName, cfg)
+	releaseToMap, latestRelease, err := getReleaseToMap(releaseName, cfg)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get release '%s' latest version", mapOptions.ReleaseName)
 	}
@@ -60,7 +62,7 @@ func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions, additionalMappi
 		log.Printf("Deprecated or removed APIs exist, for release: %s.\n", releaseName)
 	} else {
 		log.Printf("Deprecated or removed APIs exist, updating release: %s.\n", releaseName)
-		if err := updateRelease(releaseToMap, modifiedManifest, cfg); err != nil {
+		if err := updateRelease(releaseToMap, latestRelease, modifiedManifest, cfg); err != nil {
 			return errors.Wrapf(err, "failed to update release '%s'", releaseName)
 		}
 		log.Printf("Release '%s' with deprecated or removed APIs updated successfully to new version.\n", releaseName)
@@ -69,7 +71,9 @@ func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions, additionalMappi
 	return nil
 }
 
-func updateRelease(origRelease *release.Release, modifiedManifest string, cfg *action.Configuration) error {
+// updateRelease supersedes origRelease and stores a copy of it carrying the modified manifest. The copy is numbered
+// after latestRelease so that it does not collide with newer versions that are not deployed, such as failed ones.
+func updateRelease(origRelease, latestRelease *release.Release, modifiedManifest string, cfg *action.Configuration) error {
 	// Update current release version to be superseded
 	log.Printf("Set status of release version '%s' to 'superseded'.\n", getReleaseVersionName(origRelease))
 	origRelease.Info.Status = release.StatusSuperseded
@@ -80,22 +84,42 @@ func updateRelease(origRelease *release.Release, modifiedManifest string, cfg *a
 
 	// Using a shallow copy of current release version to update the object with the modification
 	// and then store this new version
-	var newRelease = origRelease
+	var newRelease = *origRelease
+	info := *origRelease.Info
+	newRelease.Info = &info
 	newRelease.Manifest = modifiedManifest
 	newRelease.Info.Description = common.UpgradeDescription
 	newRelease.Info.LastDeployed = cfg.Now()
-	newRelease.Version = origRelease.Version + 1
+	newRelease.Version = latestRelease.Version + 1
 	newRelease.Info.Status = release.StatusDeployed
-	log.Printf("Add release version '%s' with updated supported APIs.\n", getReleaseVersionName(origRelease))
-	if err := cfg.Releases.Create(newRelease); err != nil {
-		return errors.Wrapf(err, "failed to create new release version '%s'", getReleaseVersionName(origRelease))
+	log.Printf("Add release version '%s' with updated supported APIs.\n", getReleaseVersionName(&newRelease))
+	if err := cfg.Releases.Create(&newRelease); err != nil {
+		return errors.Wrapf(err, "failed to create new release version '%s'", getReleaseVersionName(&newRelease))
 	}
-	log.Printf("Release version '%s' added successfully.\n", getReleaseVersionName(origRelease))
+	log.Printf("Release version '%s' added successfully.\n", getReleaseVersionName(&newRelease))
 	return nil
 }
 
-func getLatestRelease(releaseName string, cfg *action.Configuration) (*release.Release, error) {
-	return cfg.Releases.Last(releaseName)
+// getReleaseToMap returns the release version whose manifest has to be mapped, together with the latest version of
+// the release. Like helm upgrade, it picks the last deployed version and only falls back to the latest version when
+// nothing is deployed, so that a trailing failed revision does not hide the manifest Helm will upgrade from.
+func getReleaseToMap(releaseName string, cfg *action.Configuration) (*release.Release, *release.Release, error) {
+	latest, err := cfg.Releases.Last(releaseName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if latest.Info.Status == release.StatusDeployed {
+		return latest, latest, nil
+	}
+
+	deployed, err := cfg.Releases.Deployed(releaseName)
+	if err != nil {
+		if errors.Is(err, driver.ErrNoDeployedReleases) {
+			return latest, latest, nil
+		}
+		return nil, nil, err
+	}
+	return deployed, latest, nil
 }
 
 func getReleaseVersionName(rel *release.Release) string {
